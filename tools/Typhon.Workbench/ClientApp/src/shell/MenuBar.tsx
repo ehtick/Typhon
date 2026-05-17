@@ -30,9 +30,12 @@ import {
   toggleViewSchemaIndexes,
   toggleViewSchemaLayout,
   toggleViewSchemaRelationships,
+  toggleViewSystemDag,
   saveLayoutAsDefault,
+  resetLayout,
 } from './commands/openSchemaBrowser';
-import { toggleViewCriticalPath, toggleViewProfiler, toggleViewTopSpans, registerOpenSaveReplay } from './commands/profilerCommands';
+import { toggleViewCallTree, toggleViewCriticalPath, toggleViewProfiler, toggleViewTopSpans, registerOpenSaveReplay } from './commands/profilerCommands';
+import { registerOpenConnect } from './commands/baseCommands';
 import { logError, logInfo } from '@/stores/useLogStore';
 
 export default function MenuBar() {
@@ -52,10 +55,14 @@ export default function MenuBar() {
  const [initialTab, setInitialTab] = useState<ConnectTab>('open');
  const [saveReplayOpen, setSaveReplayOpen] = useState(false);
 
- // Register the dialog opener with the module-level slot so palette commands can trigger it. Mirrors registerProfilerDockApi.
+ // Register the dialog openers with their module-level slots so palette commands can trigger them. Mirrors registerProfilerDockApi.
  useEffect(() => {
    registerOpenSaveReplay(() => setSaveReplayOpen(true));
-   return () => registerOpenSaveReplay(null);
+   registerOpenConnect((tab) => { setInitialTab(tab); setDialogOpen(true); });
+   return () => {
+     registerOpenSaveReplay(null);
+     registerOpenConnect(null);
+   };
  }, []);
 
  const openConnect = (tab: ConnectTab) => {
@@ -84,7 +91,7 @@ export default function MenuBar() {
  <MenubarTrigger className="h-7 px-2 text-density-sm">File</MenubarTrigger>
  <MenubarContent>
  <MenubarItem onClick={() => openConnect('open')}>Open .typhon File…</MenubarItem>
- <MenubarItem onClick={() => openConnect('cached')}>Open .typhon-trace…</MenubarItem>
+ <MenubarItem onClick={() => openConnect('trace')}>Open .typhon-trace…</MenubarItem>
  <MenubarItem onClick={() => openConnect('attach')}>Attach to Engine…</MenubarItem>
  <MenubarSeparator />
  <MenubarItem
@@ -157,10 +164,24 @@ export default function MenuBar() {
  </MenubarItem>
  <MenubarItem
  disabled={!isProfilerSession}
+ onClick={toggleViewSystemDag}
+ title={isProfilerSession ? undefined : 'Open a profiler trace or attach a session first'}
+ >
+ System DAG
+ </MenubarItem>
+ <MenubarItem
+ disabled={!isProfilerSession}
  onClick={toggleViewCriticalPath}
  title={isProfilerSession ? undefined : 'Open a profiler trace or attach a session first'}
  >
  Critical Path
+ </MenubarItem>
+ <MenubarItem
+ disabled={!isProfilerSession}
+ onClick={toggleViewCallTree}
+ title={isProfilerSession ? undefined : 'Open a profiler trace or attach a session first'}
+ >
+ Call Tree
  </MenubarItem>
  <MenubarItem
  disabled={!isProfilerSession}
@@ -191,6 +212,7 @@ export default function MenuBar() {
  <MenubarItem onClick={toggleTheme}>Toggle Dark / Light Mode</MenubarItem>
  <MenubarSeparator />
  <MenubarItem disabled={kind === 'none'} onClick={saveLayoutAsDefault}>Save Layout as Default</MenubarItem>
+ <MenubarItem onClick={resetLayout}>Reset Layout to Default</MenubarItem>
  </MenubarContent>
  </MenubarMenu>
 
