@@ -140,6 +140,11 @@ export function toggleViewOptions(): void {
   toggleDockPanel('options', 'Options', 'Options');
 }
 
+/** Module 15: open / close the Database File Map panel. */
+export function toggleViewDbMap(): void {
+  toggleDockPanel('dbmap', 'DbMap', 'Database File Map');
+}
+
 /** Debug-only: the colour-palette reference panel. Reachable from the command palette alone — no View-menu entry. */
 export function toggleViewPaletteDebug(): void {
   toggleDockPanel('palette-debug', 'PaletteDebug', 'Color Palettes');
@@ -209,6 +214,37 @@ export function registerResetLayout(fn: (() => void) | null): void {
  */
 export function resetLayout(): void {
   registeredResetLayout?.();
+}
+
+/**
+ * Cross-link "ensure visible" semantics — opens a dock panel if absent, focuses it if already open, never
+ * closes it. The counterpart to {@link toggleDockPanel} for reveal actions, which must always surface a panel.
+ */
+export function ensureDockPanel(id: string, componentKey: string, title: string): void {
+  const api = registeredApi;
+  if (!api) return;
+  const existing = api.getPanel(id);
+  if (existing) {
+    existing.focus();
+    return;
+  }
+  const anchor = api.getPanel('profiler') ?? api.getPanel('start-here');
+  if (anchor) {
+    api.addPanel({ id, component: componentKey, title, position: { referencePanel: anchor.id } });
+  } else {
+    api.addPanel({ id, component: componentKey, title });
+  }
+}
+
+/** Expands the left edge group and focuses the Resource Tree — the "reveal in tree" surfacing step. No-op when absent. */
+export function ensureResourceTreeVisible(): void {
+  const api = registeredApi;
+  if (!api) return;
+  const eg = api.getEdgeGroup('left');
+  if (eg?.isCollapsed()) {
+    eg.expand();
+  }
+  api.getPanel('resource-tree')?.focus();
 }
 
 function toggleDockPanel(id: string, componentKey: string, title: string): void {
