@@ -330,6 +330,31 @@ export function toggleViewStorageHealth(): void {
 }
 
 /**
+ * Dev Fixture: open / close the standalone fixture-creation surface. Dual-mode:
+ * <list type="bullet">
+ *   <item><b>With dockview registered</b> (session open) — toggle the docked panel; its body shows the
+ *     "close current session first" cold state per the no-session gate.</item>
+ *   <item><b>Without dockview</b> (Welcome / empty workspace) — toggle the modal-store flag instead, so the
+ *     panel's body renders inside a <c>DevFixtureModal</c> rendered at the Shell level. This is the typical
+ *     case: fixture generation is a pre-session activity, and on Welcome there's no dockview to dock into.
+ *     Without this fallback, clicking "Dev Fixture" on Welcome silently no-ops — the bug Loïc caught with
+ *     Playwright after the initial panel landing.</item>
+ * </list>
+ * DEBUG-only on the server side, but the toggle itself is always wired — the panel's own capability probe
+ * (`/api/fixtures/capability`) renders the "not available" cold state in Release builds, so clicks never
+ * silently fail.
+ */
+export function toggleViewDevFixture(): void {
+  if (registeredApi !== null) {
+    toggleDockPanel('dev-fixture', 'DevFixture', 'Dev Fixture');
+    return;
+  }
+  // Defer the store import to avoid a top-level circular dep risk (the store is harmless but lighter to
+  // pull lazily — the toggle path is a click handler, not a hot path).
+  void import('@/stores/useDevFixtureModalStore').then((m) => m.useDevFixtureModalStore.getState().toggle());
+}
+
+/**
  * Module 06: open the Data Browser — the Entity List in the center. The selected entity's component-card stack renders in the
  * shared Detail pane (right edge), so we surface that group too. Optionally pre-selects an archetype (the "Open in Data
  * Browser" cross-link path). Focuses the entity list; never closes anything.
