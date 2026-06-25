@@ -50,8 +50,10 @@ class StorageIntrospectionTests : TestBase<StorageIntrospectionTests>
         var types = new StoragePageType[pageCount];
         dbe.ClassifyAllPages(types);
 
-        Assert.That(types[0], Is.EqualTo(StoragePageType.Root), "page 0 is the reserved root header page");
-        Assert.That(types[1], Is.EqualTo(StoragePageType.Occupancy), "page 1 is the occupancy-segment root");
+        // v2 (CK-05): pages 0–1 are the meta pair (root header + bootstrap, A/B slots), occupancy root moved to page 2.
+        Assert.That(types[0], Is.EqualTo(StoragePageType.Root), "page 0 is the meta pair slot A (root header + bootstrap)");
+        Assert.That(types[1], Is.EqualTo(StoragePageType.Root), "page 1 is the meta pair slot B");
+        Assert.That(types[2], Is.EqualTo(StoragePageType.Occupancy), "page 2 is the occupancy-segment root");
         Assert.That(types, Does.Contain(StoragePageType.Component), "at least one component page is classified");
         Assert.That(types, Does.Contain(StoragePageType.Occupancy));
     }
@@ -157,26 +159,26 @@ class StorageIntrospectionTests : TestBase<StorageIntrospectionTests>
     }
 
     [Test]
-    public void GetOccupancyPageGovernedRange_RootGovernsFewerPagesThanSubsequent()
+    public void GetOccupancyPageGovernedRange_RootGovernsNoPages_DataPagesTile()
     {
         using var dbe = ServiceProvider.GetRequiredService<DatabaseEngine>();
         RegisterComponents(dbe);
 
-        // Root page shares its body with the 2000-byte index section → 6000 B × 8 = 48,000 governed pages.
-        // Every subsequent page has the full 8000 B data area → 8000 B × 8 = 64,000 governed pages.
+        // Directory-only root (v4): the occupancy root holds ONLY the page directory — no bitmap words — so it governs zero
+        // file pages. Every data page has the full 8000 B body → 8000 B × 8 = 64,000 governed pages.
         var root = dbe.GetOccupancyPageGovernedRange(0);
         Assert.That(root.FirstGovernedPage, Is.EqualTo(0L));
-        Assert.That(root.GovernedCount, Is.EqualTo(48_000));
+        Assert.That(root.GovernedCount, Is.EqualTo(0));
 
         var second = dbe.GetOccupancyPageGovernedRange(1);
-        Assert.That(second.FirstGovernedPage, Is.EqualTo(48_000L));
+        Assert.That(second.FirstGovernedPage, Is.EqualTo(0L));
         Assert.That(second.GovernedCount, Is.EqualTo(64_000));
 
         var third = dbe.GetOccupancyPageGovernedRange(2);
-        Assert.That(third.FirstGovernedPage, Is.EqualTo(112_000L));
+        Assert.That(third.FirstGovernedPage, Is.EqualTo(64_000L));
         Assert.That(third.GovernedCount, Is.EqualTo(64_000));
 
-        // Ranges tile the file contiguously with no gap or overlap.
+        // Ranges tile the file contiguously with no gap or overlap — the root contributes nothing, so the data pages tile from 0.
         Assert.That(second.FirstGovernedPage, Is.EqualTo(root.FirstGovernedPage + root.GovernedCount));
         Assert.That(third.FirstGovernedPage, Is.EqualTo(second.FirstGovernedPage + second.GovernedCount));
     }

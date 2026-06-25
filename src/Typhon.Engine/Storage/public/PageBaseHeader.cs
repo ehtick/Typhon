@@ -1,5 +1,6 @@
-﻿using JetBrains.Annotations;
+using JetBrains.Annotations;
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace Typhon.Engine;
@@ -46,7 +47,7 @@ public struct PageBaseHeader
     /// <summary>
     /// CRC32C checksum of the page contents, excluding this field itself.
     /// Zero means "never checksummed" (correct sentinel for pages that predate FPI support).
-    /// Computed via <c>WalCrc.ComputeSkipping(pageSpan, PageChecksumOffset, PageChecksumSize)</c>.
+    /// Computed via <c>Crc32CUtil.ComputeSkipping(pageSpan, PageChecksumOffset, PageChecksumSize)</c>.
     /// </summary>
     public uint PageChecksum;
 
@@ -62,4 +63,28 @@ public struct PageBaseHeader
 
     /// <summary>Size in bytes of <see cref="PageChecksum"/> (for CRC skip region).</summary>
     public const int PageChecksumSize = 4;
+
+    /// <summary>
+    /// Byte offset of the A/B slot-pairing generation counter (CK-05). <c>0</c> = "not a pair slot" (every normal page).
+    /// Protected pages (the meta pair; segment-directory twins in C2) stamp a monotonic <see cref="ulong"/> here; the
+    /// higher valid generation among a pair's two slots is the current one. CRC-covered (it is outside the 8–11 skip region).
+    /// <para>
+    /// The offset is <b>40</b> — the first 8-aligned slot free on <i>every</i> page type, which CK-05 requires (the same
+    /// offset is read/written uniformly regardless of what header the page otherwise carries). The page header zone packs:
+    /// <c>[0,16)</c> <see cref="PageBaseHeader"/>; <c>[16,32)</c> <c>LogicalSegmentHeader</c> on a directory page (so offsets
+    /// 16–31 are NOT free there — they are the directory's map/raw chain pointers + kind + twin index); <c>[32,36)</c>
+    /// <c>ChunkBasedSegmentHeader</c> on a chunk-segment directory page. The intersection of the free regions — meta
+    /// <c>[16,64)</c>, plain-dir <c>[32,64)</c>, chunk-dir <c>[36,64)</c> — first hits an 8-aligned slot at 40. Accessed by
+    /// offset rather than a struct field so <c>sizeof(PageBaseHeader)</c> stays 16 and no dependent layout shifts.
+    /// </para>
+    /// </summary>
+    public const int PairGenerationOffset = 40;
+
+    /// <summary>Reads the CK-05 pair generation (<see cref="PairGenerationOffset"/>) from a page image.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ulong ReadPairGeneration(ReadOnlySpan<byte> page) => MemoryMarshal.Read<ulong>(page.Slice(PairGenerationOffset));
+
+    /// <summary>Writes the CK-05 pair generation (<see cref="PairGenerationOffset"/>) into a page image.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void WritePairGeneration(Span<byte> page, ulong generation) => MemoryMarshal.Write(page.Slice(PairGenerationOffset), in generation);
 }

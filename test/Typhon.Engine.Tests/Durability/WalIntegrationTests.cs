@@ -242,7 +242,7 @@ class WalIntegrationTests : TestBase
             var storedCrc = BitConverter.ToUInt32(page, PageBaseHeader.PageChecksumOffset);
             if (storedCrc != 0)
             {
-                var computedCrc = WalCrc.ComputeSkipping(page, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize);
+                var computedCrc = Crc32CUtil.ComputeSkipping(page, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize);
                 if (computedCrc == storedCrc)
                 {
                     result.Add(i);
@@ -1104,53 +1104,6 @@ class WalIntegrationTests : TestBase
     // ═══════════════════════════════════════════════════════════════
     // Category 5: Crash Recovery
     // ═══════════════════════════════════════════════════════════════
-
-    [Test]
-    [CancelAfter(15000)]
-    public void WAL_FpiCapture_RecoveryScansRecords()
-    {
-        EntityId[] ids;
-        CompA[] expectedValues;
-
-        // Phase 1: Create entities, checkpoint, then update to trigger FPI capture
-        using (var scope1 = _serviceProvider.CreateScope())
-        {
-            var dbe = CreateEngine(scope1);
-            (ids, expectedValues) = CreateCompAEntities(dbe, 50, DurabilityMode.Immediate);
-            WaitForCheckpointComplete(dbe);
-
-            // Updates after checkpoint trigger FPI capture (bitmap cleared by checkpoint)
-            using (var uow = dbe.CreateUnitOfWork(DurabilityMode.Immediate))
-            {
-                for (int i = 0; i < 10; i++)
-                {
-                    using var tx = uow.CreateTransaction();
-                    var updated = new CompA(i + 5000, (float)(i * 9.0), i * 11.0);
-                    ref var w = ref tx.OpenMut(ids[i]).Write(CompAArch.A);
-                    w = updated;
-                    expectedValues[i] = updated; // Track the final value
-                    tx.Commit();
-                }
-
-                uow.Flush();
-            }
-        }
-
-        // Verify WAL segment files survive engine dispose
-        var walFiles = Directory.GetFiles(_walDir, "*.wal");
-        Assert.That(walFiles.Length, Is.GreaterThan(0), "WAL segment files should survive engine dispose");
-
-        // Phase 2: Reopen — recovery scans WAL segments
-        using (var scope2 = _serviceProvider.CreateScope())
-        {
-            var dbe = CreateEngine(scope2);
-            Assert.That(dbe.LastRecoveryResult.SegmentsScanned, Is.GreaterThan(0),
-                "Recovery should scan at least one WAL segment");
-
-            // All entities should be readable after clean reopen with WAL recovery
-            VerifyCompAEntities(dbe, ids, expectedValues);
-        }
-    }
 
     [Test]
     [CancelAfter(15000)]

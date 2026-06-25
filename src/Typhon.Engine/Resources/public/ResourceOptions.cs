@@ -9,11 +9,16 @@ namespace Typhon.Engine;
 [PublicAPI]
 public enum PageChecksumVerification
 {
-    /// <summary>Verify page CRC on every load from disk. Detects corruption on first access and triggers FPI repair.</summary>
+    /// <summary>Verify page CRC on every load from disk. Detects corruption on first access and throws (no repair — FPI was retired; recovery heals via the rebuild net).</summary>
     OnLoad,
 
     /// <summary>Only verify page CRC during crash recovery. Normal operation skips CRC checks for lower overhead.</summary>
     RecoveryOnly,
+
+    /// <summary>Crash-recovery suspect mode: compute the CRC and, on mismatch, RECORD the page as suspect (never throw, never FPI-repair) so the post-apply
+    /// resolution can heal it (derived → rebuilt; orphaned primary → in-window-replaced) or fail the open loudly (RB-04) if it holds live primary data. The
+    /// engine sets this on the crash path and restores the configured mode once recovery completes.</summary>
+    RecoverySuspect,
 }
 
 /// <summary>
@@ -127,6 +132,13 @@ public class ResourceOptions
     /// Checkpoint interval when idle (milliseconds).
     /// </summary>
     public int CheckpointIntervalMs { get; set; } = 30000;  // 30 seconds
+
+    /// <summary>
+    /// Bounded budget (milliseconds) for the checkpoint cycle's WAL durability barrier waits (CK-02). On timeout the
+    /// cycle raises a transient <see cref="WalBackPressureTimeoutException"/>, which the failure classification (CK-06)
+    /// treats as <see cref="DurabilityHealth.Degraded"/> + retry-next-cycle — never a permanent stall.
+    /// </summary>
+    public int CheckpointBarrierTimeoutMs { get; set; } = 30000;  // 30 seconds
 
     // ═══════════════════════════════════════════════════════════════
     // BACKUP

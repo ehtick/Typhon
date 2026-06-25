@@ -38,6 +38,12 @@ internal struct LogicalSegmentHeader
     /// introspection (Module 15) can classify every page without re-deriving ownership from context. Only meaningful on the root page.
     /// </summary>
     public StorageSegmentKind Kind;
+    /// <summary>
+    /// CK-05 A/B slot-pairing: the physical file-page index of this directory page's TWIN slot (the alternate of the two slots the directory page's
+    /// current content alternates between). Set once at allocation, immutable thereafter, identical in both slots. <c>0</c> = "no twin" (a normal,
+    /// non-directory page, or a page that predates C2). Present on every directory page — the root page and each map-extension page.
+    /// </summary>
+    public int TwinPageIndex;
 }
 
 /// <summary>
@@ -45,19 +51,23 @@ internal struct LogicalSegmentHeader
 /// </summary>
 /// <remarks>
 /// Logical Segment is made of several Pages which IDs are stored in a dedicated private section of its raw data.
-/// The segment can easily be shrunk/grown by removing/adding more pages. The first page of the Logical Segment is split in two parts
-///  - The Page Directory: 500 entries that reference the first 500 pages of the Logical Segment, overflown data is stored into
-///    subsequent dedicated pages that store only indices, so 2000 per page.
-///  - The segment first raw data, which is 6000 bytes, instead of 8000 for all subsequent pages.
+/// The segment can easily be shrunk/grown by removing/adding more pages. The first page (the ROOT) is a pure <b>directory
+/// page</b>: its entire 8000-byte raw-data area holds the page directory — 2000 entries that reference the first 2000 pages
+/// of the segment. Beyond 2000 pages, overflow entries spill into dedicated map-extension pages (also 2000 entries each).
+/// The root carries <b>no</b> segment data, so the CK-05 twin that shadows every directory page protects only the immutable
+/// directory, never live data, and root/extension directory addressing stays uniform. Consequently a segment always spans
+/// at least 2 pages (the directory root + at least one data page); the allocators clamp to this minimum.
 /// The segment also maintain a linked list in the Page Header to allow faster forward traversal.
 /// There is some basic API that allow to store/enumerate fixed size elements, indexed into the logical segment.
 /// </remarks>
 [PublicAPI]
 public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageStore
 {
-    internal const int RootHeaderIndexSectionCount = 500;
-    internal const int RootHeaderIndexSectionLength = RootHeaderIndexSectionCount * sizeof(int);
     internal const int NextHeadersIndexSectionCount = PagedMMF.PageRawDataSize / sizeof(int);
+    // Directory-only root (v4): the root page's whole raw-data area is the page directory, so it holds the SAME number of
+    // entries as a map-extension page. This makes the root carry no segment data — the CK-05 twin protects only directory.
+    internal const int RootHeaderIndexSectionCount = NextHeadersIndexSectionCount;
+    internal const int RootHeaderIndexSectionLength = RootHeaderIndexSectionCount * sizeof(int);
 
     protected TStore _store;
 
@@ -102,15 +112,67 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
     }
 
     /// <summary>
+    /// Fault <paramref name="filePageIndex"/> into the page cache and acquire its exclusive latch with NO eviction window
+    /// (#2 fix). The epoch tag does not pin a not-yet-latched slot — the grow path tags pages with a bare
+    /// <see cref="EpochManager.GlobalEpoch"/> snapshot (it cannot hold an <see cref="EpochGuard"/> across the fetch, which
+    /// blocks on page-cache back-pressure — an EBR pin held across a blocking wait deadlocks reclamation), and that
+    /// snapshot goes stale the moment the global epoch advances. So the just-faulted slot can be evicted+reused before we
+    /// latch it; writing/unlatching it then corrupts another thread's page. Defence: <see cref="IPageStore.IncrementSlotRefCount"/>
+    /// pins the one slot across the request→latch gap (Interlocked, no reclamation stall), and a bounded retry re-faults on
+    /// the rare residual miss. We NEVER proceed without the latch — exhausting retries throws rather than writing a slot we
+    /// don't own.
+    /// </summary>
+    private int RequestExclusiveForGrow(int filePageIndex, long epoch, bool verifyCrc)
+    {
+        const int maxAttempts = 64;
+        for (var attempt = 0; ; attempt++)
+        {
+            int memPageIndex;
+            if (verifyCrc)
+            {
+                _store.RequestPageEpoch(filePageIndex, epoch, out memPageIndex);
+            }
+            else
+            {
+                _store.RequestPageEpochUnchecked(filePageIndex, epoch, out memPageIndex);
+            }
+
+            // Pin the slot so it cannot be evicted between here and the latch, then latch. Once latched (PageState=Exclusive)
+            // the page is eviction-proof on its own, so the SlotRefCount pin can be dropped immediately. The drop MUST run
+            // even if TryLatchPageExclusive throws (e.g. PageCache lock-timeout) — otherwise the SlotRefCount leaks, the page
+            // becomes permanently un-evictable, and accumulated leaks fill the cache → back-pressure stalls grows that hold a
+            // page latch → the checkpoint spins forever in CopyPageWithSeqlock on that latched page. Hence try/finally.
+            _store.IncrementSlotRefCount(memPageIndex);
+            bool latched;
+            try
+            {
+                latched = _store.TryLatchPageExclusive(memPageIndex);
+            }
+            finally
+            {
+                _store.DecrementSlotRefCount(memPageIndex);
+            }
+            if (latched)
+            {
+                return memPageIndex;
+            }
+
+            if (attempt >= maxAttempts)
+            {
+                throw new InvalidOperationException(
+                    $"LogicalSegment grow could not exclusively latch file page {filePageIndex} after {maxAttempts} attempts (page-cache slot contention).");
+            }
+        }
+    }
+
+    /// <summary>
     /// Get a typed <see cref="PageAccessor"/> for a segment page with exclusive latch.
     /// Caller must be inside an <see cref="EpochGuard"/> scope.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public PageAccessor GetPageExclusive(int segmentPageIndex, long epoch, out int memPageIndex)
     {
-        _store.RequestPageEpoch(Pages[segmentPageIndex], epoch, out memPageIndex);
-        var latched = _store.TryLatchPageExclusive(memPageIndex);
-        Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpoch — page should be Idle");
+        memPageIndex = RequestExclusiveForGrow(Pages[segmentPageIndex], epoch, verifyCrc: true);
         return _store.GetPage(memPageIndex);
     }
 
@@ -121,9 +183,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal PageAccessor GetPageExclusiveUnchecked(int segmentPageIndex, long epoch, out int memPageIndex)
     {
-        _store.RequestPageEpochUnchecked(Pages[segmentPageIndex], epoch, out memPageIndex);
-        var latched = _store.TryLatchPageExclusive(memPageIndex);
-        Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpochUnchecked — page should be Idle");
+        memPageIndex = RequestExclusiveForGrow(Pages[segmentPageIndex], epoch, verifyCrc: false);
         return _store.GetPage(memPageIndex);
     }
 
@@ -145,9 +205,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public unsafe byte* GetPageAddressExclusive(int segmentPageIndex, long epoch, out int memPageIndex)
     {
-        _store.RequestPageEpoch(Pages[segmentPageIndex], epoch, out memPageIndex);
-        var latched = _store.TryLatchPageExclusive(memPageIndex);
-        Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpoch — page should be Idle");
+        memPageIndex = RequestExclusiveForGrow(Pages[segmentPageIndex], epoch, verifyCrc: true);
         return _store.GetMemPageAddress(memPageIndex);
     }
 
@@ -285,6 +343,15 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
 
     internal virtual bool Create(PageBlockType type, StorageSegmentKind kind, Span<int> filePageIndices, bool clear, ChangeSet changeSet = null)
     {
+        // Directory-only root (v4): the root page holds only the segment's page directory and carries no data, so every segment
+        // needs at least one data page beyond it (a 1-page segment would have ChunkCountRootPage==0 → zero usable chunks).
+        // The persistent allocators (AllocateSegment / AllocateChunkBasedSegment) clamp the page count to >= 2, but this is the
+        // single choke point through which ALL creation funnels — transient component/index segments (ComponentTable), the
+        // cluster segment (DatabaseEngine), genesis occupancy — so enforce the invariant here so any caller that under-allocates
+        // (today, or a future StartingSize tuned to 1) fails loudly in Debug/test rather than silently producing a 0-chunk segment.
+        Debug.Assert(filePageIndices.Length >= 2,
+            $"A v4 directory-only-root segment requires at least 2 pages (directory root + >= 1 data page); got {filePageIndices.Length}.");
+
         // The kind is persisted into the root page's header by CreateOrGrow (read back by Load) — set it before so the root-page write captures it.
         _kind = kind;
         // Phase 5: Storage:Segment:Create event. First page id doubles as the segment identifier.
@@ -372,9 +439,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                 // If it's a new page, initialize it (skip CRC — page will be fully overwritten)
                 if (isNewPage)
                 {
-                    _store.RequestPageEpochUnchecked(curMapPageIndex, epoch, out memPageIdx);
-                    var latched = _store.TryLatchPageExclusive(memPageIdx);
-                    Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpochUnchecked");
+                    memPageIdx = RequestExclusiveForGrow(curMapPageIndex, epoch, verifyCrc: false);
                     page = _store.GetPage(memPageIdx);
                     hasPage = true;
 
@@ -389,14 +454,20 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                 {
                     if (hasPage == false)
                     {
-                        _store.RequestPageEpoch(curMapPageIndex, epoch, out memPageIdx);
-                        var latched = _store.TryLatchPageExclusive(memPageIdx);
-                        Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpoch");
+                        memPageIdx = RequestExclusiveForGrow(curMapPageIndex, epoch, verifyCrc: true);
                         page = _store.GetPage(memPageIdx);
                         hasPage = true;
                     }
                     ref var lsh = ref page.StructAt<LogicalSegmentHeader>(LogicalSegmentHeader.Offset);
                     lsh.LogicalSegmentNextMapPBID = ((curIndexMapIndex + 1) < mapIndices.Length) ? mapIndices[curIndexMapIndex + 1] : 0;
+                    // CK-05 (C2): a NEW map-extension directory page gets a twin (a second physical slot it alternates between)
+                    // so a torn write can never corrupt the segment's page directory. The root's twin is stamped in the
+                    // data-page loop below; here we cover only the extension pages (curIndexMapIndex > 0). Idempotent on a store
+                    // that returns 0 (transient — not protected).
+                    if (isNewPage && (curIndexMapIndex > 0))
+                    {
+                        lsh.TwinPageIndex = _store.GetOrAllocateDirectoryTwin(curMapPageIndex, changeSet);
+                    }
                     isPageDirty = true;
                 }
 
@@ -405,9 +476,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                 {
                     if (hasPage == false)
                     {
-                        _store.RequestPageEpoch(curMapPageIndex, epoch, out memPageIdx);
-                        var latched = _store.TryLatchPageExclusive(memPageIdx);
-                        Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpoch");
+                        memPageIdx = RequestExclusiveForGrow(curMapPageIndex, epoch, verifyCrc: true);
                         page = _store.GetPage(memPageIdx);
                         hasPage = true;
                     }
@@ -430,9 +499,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
                         // The current page is full, we need on fetch one more... just to store the termination 0 value
                         else
                         {
-                            _store.RequestPageEpochUnchecked(mapIndices[curIndexMapIndex + 1], epoch, out var endMemIdx);
-                            var endLatched = _store.TryLatchPageExclusive(endMemIdx);
-                            Debug.Assert(endLatched, "TryLatchPageExclusive failed after RequestPageEpochUnchecked");
+                            var endMemIdx = RequestExclusiveForGrow(mapIndices[curIndexMapIndex + 1], epoch, verifyCrc: false);
                             var endPage = _store.GetPage(endMemIdx);
                             InitHeader(endPage.Address, PageClearMode.Header, PageBlockFlags.IsLogicalSegment, type, 1);
                             changeSet?.AddByMemPageIndex(endMemIdx);
@@ -500,9 +567,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
         if (growFrom > 0)
         {
             var oldTailFilePage = filePageIndices[growFrom - 1];
-            _store.RequestPageEpoch(oldTailFilePage, epoch, out var oldTailMemIdx);
-            var oldTailLatched = _store.TryLatchPageExclusive(oldTailMemIdx);
-            Debug.Assert(oldTailLatched, "TryLatchPageExclusive failed on old-tail page during Grow chain-patch");
+            var oldTailMemIdx = RequestExclusiveForGrow(oldTailFilePage, epoch, verifyCrc: true);
             var oldTailPage = _store.GetPage(oldTailMemIdx);
             ref var oldTailLsh = ref oldTailPage.StructAt<LogicalSegmentHeader>(LogicalSegmentHeader.Offset);
             oldTailLsh.LogicalSegmentNextRawDataPBID = filePageIndices[growFrom];
@@ -527,9 +592,7 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
         for (var i = growFrom; i < filePageIndices.Length; i++)
         {
             var pageIndex = filePageIndices[i];
-            _store.RequestPageEpochUnchecked(pageIndex, epoch, out var memPageIdx);
-            var latched = _store.TryLatchPageExclusive(memPageIdx);
-            Debug.Assert(latched, "TryLatchPageExclusive failed after RequestPageEpochUnchecked");
+            var memPageIdx = RequestExclusiveForGrow(pageIndex, epoch, verifyCrc: false);
             var page = _store.GetPage(memPageIdx);
 
             if (clear)
@@ -547,6 +610,10 @@ public class LogicalSegment<TStore> : IDisposable where TStore : struct, IPageSt
             if (i == 0)
             {
                 lsh.Kind = _kind;
+                // CK-05 (C2): the root is a directory page — give it a twin so a torn root write can't brick the segment.
+                // Stamped only at Create (growFrom == 0 reaches i == 0); on Grow the root keeps its existing twin. A
+                // transient store returns 0 ("no twin"); the occupancy root resolves to its pre-reserved twin (page 3).
+                lsh.TwinPageIndex = _store.GetOrAllocateDirectoryTwin(filePageIndices[0], changeSet);
             }
 
             // Durability: see comment in the map-page-update block above — CP-04 race defence needs DC ≥ 2 BEFORE the

@@ -148,6 +148,13 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
     /// <summary>The highest LSN that has been durably written to stable media.</summary>
     public long DurableLsn => Interlocked.Read(ref _durableLsn);
 
+    /// <summary>
+    /// Seeds the durable watermark to a value already durable on disk from a prior lifecycle — used by crash recovery to mark the
+    /// replayed WAL frontier as durable so the post-recovery seal checkpoint targets it (the cycle's targetLsn is DurableLsn, which
+    /// is otherwise 0 on a fresh-opened writer). Monotonic; safe to call before the writer has produced any records this session.
+    /// </summary>
+    internal void SeedDurableLsn(long lsn) => AdvanceDurable(lsn);
+
     /// <summary>Whether the writer thread is currently running.</summary>
     public bool IsRunning => _thread != null && _thread.IsAlive;
 
@@ -320,17 +327,10 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
                     }
                 }
 
-                // 3. Walk frames to track the highest LSN in this batch
-                long batchHighLsn = 0;
-                int totalRecordCount = 0;
-                WalCommitBuffer.WalkFrames(data, (payload, recordCount) =>
-                {
-                    totalRecordCount += recordCount;
-                });
-
-                // The highest LSN is: current NextLsn - 1 (since NextLsn has already been advanced by producers)
-                // We compute it from the commit buffer's NextLsn at drain time minus remaining undrained records
-                batchHighLsn = _commitBuffer.NextLsn - 1;
+                // 3. Highest LSN actually contained in this drained batch (LOG-05 honest watermark). TryDrain accumulated it from the drained frames' headers.
+                //    This is NOT NextLsn - 1: that counts claims which have been assigned an LSN but whose frames are not yet drained/written, so advancing the
+                //    durable watermark to it falsely acknowledges records still sitting in the buffer (TXW-2). LastDrainHighLsn never exceeds bytes about to be written.
+                long batchHighLsn = _commitBuffer.LastDrainHighLsn;
 
                 // WalFlush span: covers the write + signal cycle. The WAL writer thread claims its own ThreadSlotRegistry slot
                 // on first emit, so it appears as a dedicated lane in the viewer.
@@ -409,15 +409,16 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
                     }
 
                     // 7. Advance durable LSN and signal waiters. Phase 8: Signal span — LSN advance + waiter wake-up.
-                    if (batchHighLsn > 0)
+                    //    The outer check only gates span emission (avoid creating the Signal span when no advance is likely); AdvanceDurable performs the
+                    //    monotonic advance itself.
+                    if (batchHighLsn > Interlocked.Read(ref _durableLsn))
                     {
                         var signalScope = TyphonEvent.BeginDurabilityWalSignal(batchHighLsn);
                         try
                         {
                             Logger?.LogDebug("WAL writer: advancing durable LSN to {DurableLsn}, wrote {BytesWritten} bytes ({FrameCount} frames)",
                                 batchHighLsn, bytesToWrite, frameCount);
-                            Interlocked.Exchange(ref _durableLsn, batchHighLsn);
-                            _durabilityEvent.Set();
+                            AdvanceDurable(batchHighLsn);
                         }
                         finally
                         {
@@ -475,41 +476,53 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
     }
 
     /// <summary>
-    /// Writes data larger than the staging buffer in aligned chunks.
+    /// Writes a drained batch larger than the staging buffer. The CRC chain must be patched over the WHOLE batch in one pass: a record-batch chunk can be up to
+    /// <see cref="RecordCodec.DefaultMaxChunkSize"/> (~64 KB) and a single committed frame up to the commit-buffer capacity (megabytes), so a chunk routinely straddles
+    /// a staging-sized write boundary. Patching per-write-slice (the old behaviour) left any straddling chunk's footer CRC at its zero placeholder, which recovery then
+    /// reads as a CRC break and treats as a torn tail — silently truncating the WAL at that point and losing every record after it. So patch first, then stream.
     /// </summary>
+    /// <remarks>
+    /// Patching happens in place on the drained region of the commit buffer. The WAL writer is the buffer's single consumer and producers never touch a frame once it is
+    /// published (they only claim space ahead of the tail), so mutating the published bytes here races with nothing; the region is recycled (cleared) only on the next
+    /// buffer swap, well after this write completes. Intermediate slices are exactly <see cref="_stagingBufferSize"/> (a 4096 multiple), so the batch lands contiguously
+    /// on disk — identical bytes to what the single-write path would produce — with zero padding only after the final slice.
+    /// </remarks>
     private void WriteInChunks(ReadOnlySpan<byte> data)
     {
         var segment = _segmentManager.ActiveSegment;
-        int offset = 0;
 
+        // Patch the entire batch's CRC chain in one pass before any byte reaches disk (see remarks). `data` aliases the pinned commit buffer, so a writable view over the
+        // same memory is sound — the bytes are mutable; the ReadOnlySpan is only an access restriction on this seam.
+        fixed (byte* dataPtr = data)
+        {
+            PatchChunkCrcs(new Span<byte>(dataPtr, data.Length), data.Length);
+        }
+
+        int offset = 0;
         while (offset < data.Length)
         {
-            var remaining = data.Length - offset;
-            var chunkDataLen = Math.Min(remaining, _stagingBufferSize);
-            var chunkWriteLen = AlignUp(chunkDataLen, PageSize);
+            var sliceLen = Math.Min(data.Length - offset, _stagingBufferSize);
+            var writeLen = AlignUp(sliceLen, PageSize);
 
-            // Copy chunk to staging buffer
-            data.Slice(offset, chunkDataLen).CopyTo(new Span<byte>(_stagingBuffer, _stagingBufferSize));
+            // Copy the already-patched slice to the aligned staging buffer (the O_DIRECT write source must be page-aligned; the commit buffer is only 64-byte aligned).
+            data.Slice(offset, sliceLen).CopyTo(new Span<byte>(_stagingBuffer, _stagingBufferSize));
 
-            // Zero-pad
-            var padLen = chunkWriteLen - chunkDataLen;
+            // Zero-pad the tail — only ever non-empty on the final slice, since intermediate slices are a whole _stagingBufferSize (page multiple) and stay contiguous.
+            var padLen = writeLen - sliceLen;
             if (padLen > 0)
             {
-                new Span<byte>(_stagingBuffer + chunkDataLen, padLen).Clear();
+                new Span<byte>(_stagingBuffer + sliceLen, padLen).Clear();
             }
 
-            // Patch chunk CRCs before writing to disk
-            PatchChunkCrcs(new Span<byte>(_stagingBuffer, _stagingBufferSize), chunkDataLen);
-
-            var writeSpan = new ReadOnlySpan<byte>(_stagingBuffer, chunkWriteLen);
+            var writeSpan = new ReadOnlySpan<byte>(_stagingBuffer, writeLen);
 
             var flushStart = Stopwatch.GetTimestamp();
             _fileIO.WriteAligned(segment.Handle, segment.WriteOffset, writeSpan);
             RecordFlushLatency(flushStart);
 
-            segment.WriteOffset += chunkWriteLen;
-            Interlocked.Add(ref _totalBytesWritten, chunkWriteLen);
-            offset += chunkDataLen;
+            segment.WriteOffset += writeLen;
+            Interlocked.Add(ref _totalBytesWritten, writeLen);
+            offset += sliceLen;
         }
     }
 
@@ -560,13 +573,83 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
 
             _commitBuffer.CompleteDrain(data.Length);
 
-            // Final durable LSN advance
-            var finalLsn = _commitBuffer.NextLsn - 1;
-            Interlocked.Exchange(ref _durableLsn, finalLsn);
-            _durabilityEvent.Set();
+            // Final durable LSN advance — honest watermark over the drained frames (LOG-05), monotonic; never NextLsn - 1 (TXW-2).
+            AdvanceDurable(_commitBuffer.LastDrainHighLsn);
         }
 
         // Final flush to ensure everything is on stable media
+        PerformFlush();
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Synchronous drain (crash-simulation tests — OQ-3)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Synchronously drains and writes every currently-published WAL frame on the CALLING thread, then flushes — the deterministic equivalent of running the
+    /// background drain loop to quiescence. Runs the same staging-copy → CRC-patch → <see cref="IWalFileIO.WriteAligned"/> → durable-watermark-advance path as
+    /// <see cref="WriterLoop"/> (minus telemetry spans), so a crash-simulation test can drive the real write path and fail the underlying <see cref="IWalFileIO"/>
+    /// at a chosen write/flush boundary, then inspect the resulting on-disk state.
+    /// </summary>
+    /// <remarks>
+    /// The background writer thread MUST NOT be running: the CRC chain state (<see cref="_lastFooterCrc"/>) assumes single-threaded access. Crash tests either never
+    /// call <see cref="Start"/> or stop the thread first.
+    /// </remarks>
+    internal void DrainAndWriteSync()
+    {
+        if (IsRunning)
+        {
+            ThrowHelper.ThrowInvalidOp("DrainAndWriteSync must not be called while the WAL writer thread is running (CRC chain state is single-threaded).");
+        }
+
+        while (_commitBuffer.TryDrain(out var data, out var frameCount))
+        {
+            if (frameCount == 0)
+            {
+                break;
+            }
+
+            // Honest watermark over exactly these frames (LOG-05), captured before the write so a crash mid-write leaves the watermark unadvanced.
+            var batchHighLsn = _commitBuffer.LastDrainHighLsn;
+            var bytesToWrite = AlignUp(data.Length, PageSize);
+
+            if (bytesToWrite > _stagingBufferSize)
+            {
+                WriteInChunks(data);
+            }
+            else
+            {
+                data.CopyTo(new Span<byte>(_stagingBuffer, _stagingBufferSize));
+
+                var padLength = bytesToWrite - data.Length;
+                if (padLength > 0)
+                {
+                    new Span<byte>(_stagingBuffer + data.Length, padLength).Clear();
+                }
+
+                PatchChunkCrcs(new Span<byte>(_stagingBuffer, _stagingBufferSize), data.Length);
+
+                var segment = _segmentManager.ActiveSegment;
+                var writeSpan = new ReadOnlySpan<byte>(_stagingBuffer, bytesToWrite);
+                _fileIO.WriteAligned(segment.Handle, segment.WriteOffset, writeSpan);
+                segment.WriteOffset += bytesToWrite;
+                Interlocked.Add(ref _totalBytesWritten, bytesToWrite);
+            }
+
+            _commitBuffer.CompleteDrain(data.Length);
+
+            AdvanceDurable(batchHighLsn);
+
+            Interlocked.Increment(ref _totalFlushes);
+
+            // Segment rotation parity with WriterLoop so multi-segment sync workloads behave like production.
+            if (_segmentManager.ActiveSegmentUtilization >= RotationThreshold)
+            {
+                _segmentManager.RotateSegment(batchHighLsn + 1, batchHighLsn);
+                _lastFooterCrc = 0;
+            }
+        }
+
         PerformFlush();
     }
 
@@ -618,7 +701,7 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
 
                 // 2. Compute CRC over [0, ChunkSize - FooterSize) — header + body
                 var crcSpan = stagingData.Slice(chunkOffset, chunkHeader.ChunkSize - WalChunkFooter.SizeInBytes);
-                var crc = WalCrc.Compute(crcSpan);
+                var crc = Crc32CUtil.Compute(crcSpan);
 
                 // 3. Write footer CRC
                 Unsafe.As<byte, uint>(ref stagingData[chunkOffset + chunkHeader.ChunkSize - WalChunkFooter.SizeInBytes]) = crc;
@@ -635,6 +718,21 @@ internal sealed unsafe class WalWriter : ResourceNode, IMetricSource
     // ═══════════════════════════════════════════════════════════════
     // Internal helpers
     // ═══════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Monotonically advances the durable watermark to <paramref name="candidate"/> and wakes waiters. The single source of the advance invariant, shared by the
+    /// background drain loop, shutdown drain, and the synchronous crash-test drain. Monotonic: a batch's high LSN can fall below the current watermark when claim
+    /// order and buffer/drain order diverge (tail and LSN are claimed via two independent <c>Interlocked.Add</c>s); lowering the watermark would un-acknowledge an
+    /// already-durable record. Caller is the single consumer (writer thread or a stopped-thread sync drain), so no CAS loop is needed.
+    /// </summary>
+    private void AdvanceDurable(long candidate)
+    {
+        if (candidate > Interlocked.Read(ref _durableLsn))
+        {
+            Interlocked.Exchange(ref _durableLsn, candidate);
+            _durabilityEvent.Set();
+        }
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int AlignUp(int value, int alignment) => (value + alignment - 1) & ~(alignment - 1);

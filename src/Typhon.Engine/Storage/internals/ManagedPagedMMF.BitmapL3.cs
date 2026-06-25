@@ -58,8 +58,8 @@ public partial class ManagedPagedMMF
             var (pageIndex, pageOffset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(l0Offset);
             var epoch = _segment.Store.EpochManager.GlobalEpoch;
             var page = _segment.GetPageExclusive(pageIndex, epoch, out var memPageIdx);
-            var dataOffset = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-            var data = page.RawData<long>(dataOffset, (PageRawDataSize - dataOffset) / sizeof(long));
+            Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+            var data = page.RawData<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
             {
                 var prevL0 = Interlocked.Or(ref data[pageOffset], l0Mask);
                 if ((prevL0 & l0Mask) != 0)
@@ -71,7 +71,7 @@ public partial class ManagedPagedMMF
 
                 if (data[pageOffset] != prevL0)
                 {
-                    changeSet?.AddByMemPageIndex(memPageIdx);
+                    MarkOccupancyPageDurable(memPageIdx, changeSet);
                 }
 
                 if (prevL0 != -1 && (prevL0 | l0Mask) == -1)
@@ -102,6 +102,28 @@ public partial class ManagedPagedMMF
             return true;
         }
 
+        /// <summary>
+        /// Keeps an occupancy bitmap data page durable after a bit change. With a ChangeSet the page rides the UoW lifecycle
+        /// (AddByMemPageIndex → IncrementDirty, ReleaseExcessDirtyMarks caps at 1). WITHOUT one (archetype / cluster / entity-map
+        /// allocations pass <c>null</c>), the bit would otherwise be set in memory only — and since the directory-only root (v4)
+        /// moved the L0 words off the always-resident segment root onto a plain data page, that page can be evicted between
+        /// allocations and reload stale, dropping the bit so the same pages get handed out twice (and losing the bit across a
+        /// reopen). <see cref="IPageStore.EnsureDirtyAtLeast"/> holds it dirty until the next checkpoint persists it, then it is
+        /// safely evictable again (disk now carries the bit).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void MarkOccupancyPageDurable(int memPageIdx, ChangeSet changeSet)
+        {
+            if (changeSet != null)
+            {
+                changeSet.AddByMemPageIndex(memPageIdx);
+            }
+            else
+            {
+                _segment.Store.EnsureDirtyAtLeast(memPageIdx, 1);
+            }
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining | MethodImplOptions.AggressiveOptimization)]
         public bool SetL1(int index, ChangeSet changeSet = null)
         {
@@ -111,8 +133,8 @@ public partial class ManagedPagedMMF
             var (pageIndex, pageOffset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(l0Offset);
             var epoch = _segment.Store.EpochManager.GlobalEpoch;
             var page = _segment.GetPageExclusive(pageIndex, epoch, out var memPageIdx);
-            var dataOffset = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-            var data = page.RawData<long>(dataOffset, (PageRawDataSize - dataOffset) / sizeof(long));
+            Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+            var data = page.RawData<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
             {
                 // CAS, not OR: bulk-allocate the entire L1 word IFF every bit is currently zero. The previous implementation used `Interlocked.Or(...)`
                 // which can't be undone — when the L1 word turned out to be partially occupied, the function returned false but had already set every
@@ -130,7 +152,7 @@ public partial class ManagedPagedMMF
 
                 if (data[pageOffset] != prevL0)
                 {
-                    changeSet?.AddByMemPageIndex(memPageIdx);
+                    MarkOccupancyPageDurable(memPageIdx, changeSet);
                 }
 
                 if (prevL0 != -1 && (prevL0 | l0Mask) == -1)
@@ -171,13 +193,13 @@ public partial class ManagedPagedMMF
             var (pageIndex, pageOffset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(l0Offset);
             var epoch = _segment.Store.EpochManager.GlobalEpoch;
             var page = _segment.GetPageExclusive(pageIndex, epoch, out var memPageIdx);
-            var dataOff = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-            var data = page.RawData<long>(dataOff, (PageRawDataSize - dataOff) / sizeof(long));
+            Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+            var data = page.RawData<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
             {
                 var prevL0 = Interlocked.And(ref data[pageOffset], l0ClearMask);
                 if ((prevL0 & l0SetMask) != 0)
                 {
-                    changeSet?.AddByMemPageIndex(memPageIdx);
+                    MarkOccupancyPageDurable(memPageIdx, changeSet);
                 }
 
                 if ((prevL0 == -1) && ((prevL0 & l0ClearMask) != -1))
@@ -216,8 +238,8 @@ public partial class ManagedPagedMMF
             var (pageIndex, pageOffset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(offset);
             var epoch = _segment.Store.EpochManager.GlobalEpoch;
             var page = _segment.GetPage(pageIndex, epoch, out _);
-            var dataOff = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-            var data = page.RawDataReadOnly<long>(dataOff, (PageRawDataSize - dataOff) / sizeof(long));
+            Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+            var data = page.RawDataReadOnly<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
             return (data[pageOffset] & mask) != 0L;
         }
 
@@ -251,8 +273,8 @@ public partial class ManagedPagedMMF
                         if (pageId != curPageId)
                         {
                             var page = _segment.GetPage(pageId, epoch, out _);
-                            var dataOff = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-                            curDataSpan = page.RawDataReadOnly<long>(dataOff, (PageRawDataSize - dataOff) / sizeof(long));
+                            Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+                            curDataSpan = page.RawDataReadOnly<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
                             curPageId = pageId;
                         }
                         var data = curDataSpan;
@@ -501,11 +523,134 @@ public partial class ManagedPagedMMF
                 if (pageId != curPageId)
                 {
                     var page = _segment.GetPage(pageId, epoch, out _);
-                    var dataOff = page.IsRoot ? LogicalSegment<PersistentStore>.RootHeaderIndexSectionLength : 0;
-                    curData = page.RawDataReadOnly<long>(dataOff, (PageRawDataSize - dataOff) / sizeof(long));
+                    Debug.Assert(!page.IsRoot, "v4: occupancy L0/L1 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+                    curData = page.RawDataReadOnly<long>(0, PageRawDataSize / sizeof(long));   // always offset 0 — the old root-branch was dead, removed
                     curPageId = pageId;
                 }
                 dest[i] = curData[offset];
+            }
+        }
+
+        /// <summary>
+        /// Crash-recovery occupancy re-derive (03 §7 / rule CK-09): overwrites the persisted L0 occupancy words WHOLESALE with the authoritative
+        /// <paramref name="derived"/> bitmap (built from segment ownership — see <see cref="DatabaseEngine.BuildOwnedPageBitmap"/>), then recomputes the in-memory
+        /// L1/L2 summaries from the new L0. A wholesale overwrite, NOT a read-then-diff: a CRC-torn persisted L0 page reads as garbage, so only a full replacement
+        /// heals it — this is the FPI replacement for the occupancy bitmap. The overwrite also reclaims orphan pages a torn checkpoint leaked (bit set, no claimant)
+        /// and re-protects any phantom (claimed but bit clear). Each rewritten page is marked durable so the post-recovery seal persists it. Recovery-only and
+        /// single-threaded (the engine accepts no transactions); the caller holds <c>_occupancyMapAccess</c> exclusive via <see cref="ManagedPagedMMF.RederiveOccupancy"/>.
+        /// </summary>
+        internal int OverwriteFromDerived(ReadOnlySpan<long> derived, ChangeSet changeSet)
+        {
+            var wordCount = (Capacity + 63) / 64;
+            if (derived.Length < wordCount)
+            {
+                throw new ArgumentException($"Derived bitmap too small: need {wordCount} words, got {derived.Length}.", nameof(derived));
+            }
+
+            var epoch = _segment.Store.EpochManager.GlobalEpoch;
+            var wordsPerPage = PageRawDataSize / sizeof(long);
+            var curPageId = -1;
+            var curMemIdx = -1;
+            Span<long> curData = default;
+            var dirty = false;
+            var wordsChanged = 0;
+
+            for (var i = 0; i < wordCount; i++)
+            {
+                var (pageId, offset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(i);
+                if (pageId != curPageId)
+                {
+                    if (curPageId >= 0)
+                    {
+                        if (dirty)
+                        {
+                            MarkOccupancyPageDurable(curMemIdx, changeSet);
+                        }
+
+                        _segment.Store.UnlatchPageExclusive(curMemIdx);
+                    }
+
+                    var page = _segment.GetPageExclusive(pageId, epoch, out curMemIdx);
+                    Debug.Assert(!page.IsRoot, "v4: occupancy L0 words never resolve to the directory-only root (GetItemLocation routes them to data pages)");
+                    curData = page.RawData<long>(0, wordsPerPage);
+                    curPageId = pageId;
+                    dirty = false;
+                }
+
+                if (curData[offset] != derived[i])
+                {
+                    curData[offset] = derived[i];
+                    dirty = true;
+                    wordsChanged++;
+                }
+            }
+
+            if (curPageId >= 0)
+            {
+                if (dirty)
+                {
+                    MarkOccupancyPageDurable(curMemIdx, changeSet);
+                }
+
+                _segment.Store.UnlatchPageExclusive(curMemIdx);
+            }
+
+            RecomputeSummariesFromL0();
+            return wordsChanged;
+        }
+
+        /// <summary>
+        /// Rebuilds the in-memory L1/L2 summaries (<see cref="_l1All"/>/<see cref="_l1Any"/>/<see cref="_l2All"/>) from the persisted L0 words. Used after
+        /// <see cref="OverwriteFromDerived"/> so the allocator's skip levels are exact rather than the safe-but-stale zero state a fresh reopen leaves them in
+        /// (<see cref="FindNextUnsetL1"/> is CAS-guarded against L0, so stale summaries are never unsafe — only suboptimal — but the re-derive can cheaply make them
+        /// exact). L1Any[g] = any bit set in group g; L1All[g] = group g fully -1; L2All[h] = L1All word h fully -1 — matching the incremental invariants in
+        /// <see cref="SetL0"/>/<see cref="ClearL0"/>.
+        /// </summary>
+        private void RecomputeSummariesFromL0()
+        {
+            _l1All.Span.Clear();
+            _l1Any.Span.Clear();
+            _l2All.Span.Clear();
+
+            var wordCount = (Capacity + 63) / 64;
+            var wordsPerPage = PageRawDataSize / sizeof(long);
+            var epoch = _segment.Store.EpochManager.GlobalEpoch;
+            var curPageId = -1;
+            ReadOnlySpan<long> curData = default;
+
+            for (var l0Offset = 0; l0Offset < wordCount; l0Offset++)
+            {
+                var (pageId, offset) = LogicalSegment<PersistentStore>.GetItemLocation<long>(l0Offset);
+                if (pageId != curPageId)
+                {
+                    var page = _segment.GetPage(pageId, epoch, out _);
+                    curData = page.RawDataReadOnly<long>(0, wordsPerPage);
+                    curPageId = pageId;
+                }
+
+                var l0 = curData[offset];
+                if (l0 == 0)
+                {
+                    continue;
+                }
+
+                var l1Offset = l0Offset >> 6;
+                var l1Mask = 1L << (l0Offset & 0x3F);
+                _l1Any.Span[l1Offset] |= l1Mask;
+                if (l0 == -1)
+                {
+                    _l1All.Span[l1Offset] |= l1Mask;
+                }
+            }
+
+            for (var l1Idx = 0; l1Idx < _l1All.Length; l1Idx++)
+            {
+                if (_l1All.Span[l1Idx] == -1)
+                {
+                    var l2Offset = l1Idx >> 6;
+                    var l2Mask = 1L << (l1Idx & 0x3F);
+                    _l2All.Span[l2Offset] |= l2Mask;
+                }
             }
         }
 

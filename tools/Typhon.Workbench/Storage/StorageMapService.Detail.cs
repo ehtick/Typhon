@@ -162,7 +162,7 @@ public sealed partial class StorageMapService
         var read = engine.TryReadPageBody(pageIndex, body);
         var header = read ? MemoryMarshal.Read<PageBaseHeader>(body) : default;
         var crcStatus = read ? ClassifyCrc(body, header.PageChecksum) : StorageCrcStatus.Unverified;
-        var liveCrc = read ? WalCrc.ComputeSkipping(body, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize) : 0u;
+        var liveCrc = read ? Crc32CUtil.ComputeSkipping(body, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize) : 0u;
 
         var ownerId = map.OwnerSegmentId[cell];
 
@@ -199,10 +199,11 @@ public sealed partial class StorageMapService
             {
                 var dataOffset = descriptor.OtherDataOffset;
                 // Decompose the bytes before chunk 0 into the three distinct overhead parts so the renderer maps the
-                // page's memory honestly (A6): the fixed per-page header, the root-only segment directory (page-index
-                // table), and the stride-alignment padding the engine inserts so chunks start stride-aligned. The
-                // padding grows with the stride — that's why a large-stride segment (e.g. cluster) shows a wider
-                // overhead band than a small-stride one even on a non-root page.
+                // page's memory honestly (A6): the fixed per-page header, the root-page segment directory (page-index
+                // table), and the stride-alignment padding the engine inserts so chunks start stride-aligned. With the
+                // directory-only root (v4) the root's directory fills the entire 8000-byte body, so a root page renders as
+                // all-directory with zero chunks; only non-root data pages carry chunks. The padding grows with the stride
+                // — that's why a large-stride segment (e.g. cluster) shows a wider overhead band on a non-root page.
                 headerBytes = PagedMMF.PageHeaderSize;
                 var pages = descriptor.Pages.Span;
                 for (var k = 0; k < pages.Length; k++)
@@ -572,7 +573,7 @@ public sealed partial class StorageMapService
         {
             return StorageCrcStatus.Unverified;
         }
-        var live = WalCrc.ComputeSkipping(body, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize);
+        var live = Crc32CUtil.ComputeSkipping(body, PageBaseHeader.PageChecksumOffset, PageBaseHeader.PageChecksumSize);
         return live == storedChecksum ? StorageCrcStatus.Verified : StorageCrcStatus.Failed;
     }
 
