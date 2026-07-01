@@ -38,10 +38,8 @@ jobs:
             engine:
               - 'src/Typhon.Engine/**'
               - 'test/Typhon.Engine.Tests/**'
-              - 'Typhon.slnx'
             workbench:
               - 'tools/Typhon.Workbench/**'
-              - 'Typhon.slnx'
             tla:
               - 'src/Typhon.Engine/Durability/**'
 
@@ -105,7 +103,7 @@ jobs:
       - name: Checkout typhon-claude (TLA specs)
         uses: actions/checkout@v4
         with:
-          repository: log2n-io/typhon-claude
+          repository: Log2n-io/Typhon-Claude
           ssh-key: ${{ secrets.TYPHON_CLAUDE_DEPLOY_KEY }}
           path: typhon-claude
 
