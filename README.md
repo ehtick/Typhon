@@ -2,6 +2,9 @@
 
 [![.NET](https://img.shields.io/badge/.NET-10-512BD4)](https://dotnet.microsoft.com/)
 
+> ### 📣 New here? Read [**PITCH.md**](PITCH.md) first.
+> It makes the case for Typhon — the problem it solves, what's actually built and measured today, and where it's headed — before you dive into the technical docs below.
+
 ### ⚠️ The engine is in active development and not usable as a library or product. ⚠️
 
 There is no reference documentation, no stable API, no NuGet package, and no support.
@@ -16,6 +19,8 @@ The runtime doesn't sit on top of the database — it runs inside it.
 📖 **Start here:**
 - **[User Guide](doc/guide/README.md)** — learn the key concepts hands-on, backed by a small **runnable sample project** ([`doc/guide/example`](doc/guide/example)).
 - **[In-Depth Overview](doc/in-depth-overview/README.md)** — dig into how every subsystem works, and the reasoning behind it.
+
+🗺️ **Curious what's next?** Current priorities, in-progress work, and the roadmap are tracked live on the [GitHub Project](https://github.com/orgs/Log2n-io/projects/1/views/1).
 
 ---
 
