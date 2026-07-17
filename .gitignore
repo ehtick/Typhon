@@ -318,3 +318,11 @@ scratch/
 **/*.typhon-trace-cache
 **/*.typhon-replay
 **/*.wal
+
+# Root-only working-tree residue (leading '/' is REQUIRED — a bare filename would
+# also un-track the intentional per-project copies under test/*, demo/*, benchmark).
+# typhon.telemetry.json: the runtime reads it from CWD; root copy is a stray artifact.
+# check-durations.*: throwaway trace-duration diagnostics (belong in scratch/).
+/typhon.telemetry.json
+/check-durations.csx
+/check-durations.ps1
