@@ -1239,6 +1239,16 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
                 {
                     _memPageIndexByFilePageIndex.TryRemove(info.FilePageIndex, out _);
                 }
+                // Reset the seqlock ModificationCounter to a known EVEN (quiescent) value as the slot is repurposed. The counter is per-slot memory, never
+                // reset elsewhere — TryLatch/Unlatch only increment it (parity-preserving) and the page-clear path deliberately PRESERVES it. So a slot whose
+                // prior occupant left an ODD value (e.g. an OLC-only page that never touched the counter, over stale/loaded memory) would hand that odd value
+                // to the fresh page, making it look permanently "write-in-progress": CopyPageWithSeqlock then spin-waits the full 100 ms skip timeout on a page
+                // no one is writing, every checkpoint cycle. A page loaded from disk immediately overwrites this with its persisted (even) counter; a freshly
+                // grown page keeps the 0. Done under StateSyncRoot with the slot detached from any accessor (Idle/Free, ACW==0, not dirty), so no reader races.
+                unsafe
+                {
+                    ((PageBaseHeader*)(_memPagesAddr + info.MemPageIndex * (long)PageSize))->ModificationCounter = 0;
+                }
                 info.ResetClockSweepCounter();
                 info.FilePageIndex = -1;
                 info.AccessEpoch = 0;  // Clear epoch tag on reallocation
@@ -1668,7 +1678,11 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
     internal void FlushToDisk()
     {
         FlushToDiskInterceptor?.Invoke();   // test-only: records the fsync barrier for crash simulation
-        if (_fileHandle != null && !_fileHandle.IsInvalid)
+        // TestMode skips the physical fsync (FlushFileBuffers): a unit test lives in one process, so its writes remain visible via the OS page cache even
+        // without a sync — the sync only matters for real power-loss durability, which same-process tests can't exercise (crash-simulation fixtures reproduce a
+        // crash via interceptors + the clean-shutdown marker, not by dropping the OS cache). The interceptor above still fires, so barrier-counting crash tests
+        // are unaffected. This is the single largest test-suite lever (fsync dominated wall-clock). Production and any fixture that leaves TestMode off still sync.
+        if (!Options.TestMode && _fileHandle != null && !_fileHandle.IsInvalid)
         {
             RandomAccess.FlushToDisk(_fileHandle);
         }
@@ -1697,10 +1711,10 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
     /// Spins while the page's <see cref="PageBaseHeader.ModificationCounter"/> is odd (writer in progress),
     /// then memcpys the page and validates the counter hasn't changed. Retries on torn reads.
     /// </summary>
-    /// <returns>True if a consistent snapshot was obtained; false if the page was skipped because a writer
-    /// held the modification counter odd for longer than the checkpoint skip threshold (100ms).
-    /// Skipping is safe: the page remains dirty and will be captured in the next checkpoint cycle.</returns>
-    private unsafe bool CopyPageWithSeqlock(byte* pageAddr, byte* destAddr)
+    /// <returns>True if a consistent snapshot was obtained; false if the page was skipped — either because a real exclusive writer held the modification
+    /// counter odd for longer than the checkpoint skip threshold (100ms), or because the counter was odd on a page no writer holds (a stale counter, skipped
+    /// immediately). Skipping is safe: the page remains dirty and will be captured in the next checkpoint cycle.</returns>
+    private unsafe bool CopyPageWithSeqlock(byte* pageAddr, byte* destAddr, int memPageIndex)
     {
         var sw = new SpinWait();
         long oddSpinStart = 0;
@@ -1710,7 +1724,17 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
             var counter = ((PageBaseHeader*)pageAddr)->ModificationCounter;
             if ((counter & 1) != 0)
             {
-                // Writer in progress — track how long we've been waiting
+                // A real writer sets PageState=Exclusive BEFORE making the counter odd (TryLatchPageExclusive) and makes it even BEFORE clearing Exclusive
+                // (UnlatchPageExclusive). So an odd counter on a page that is NOT Exclusive-latched is stale — there is no writer to wait for (x64 TSO preserves
+                // that store order, so seeing the odd counter implies the earlier PageState=Exclusive store is visible too). Skip at once instead of burning the
+                // full 100ms timeout. Defensive: TryAcquire resets the counter to even on slot reuse, so a quiescent page should never present odd here.
+                if (_memPagesInfo[memPageIndex].PageState != PageState.Exclusive)
+                {
+                    LogStaleSeqlockCounterSkip(Logger, memPageIndex, counter);
+                    return false;
+                }
+
+                // A real exclusive writer holds the page — track how long we've been waiting
                 if (oddSpinStart == 0)
                 {
                     oddSpinStart = Stopwatch.GetTimestamp();
@@ -1723,9 +1747,7 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
                         // Writer has held the page for >100ms — likely blocked (e.g., waiting for
                         // backpressure to free cache pages). Skip this page to avoid deadlock:
                         // the writer may be waiting for this checkpoint to complete DecrementDirty.
-                        Logger.LogWarning(
-                            "CopyPageWithSeqlock: skipping page after {ElapsedMs:F0}ms — writer holding odd ModificationCounter={Counter}",
-                            elapsedMs, counter);
+                        LogSeqlockWriterHeldSkip(Logger, (int)elapsedMs, counter);
                         return false;
                     }
                 }
@@ -1802,7 +1824,7 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
             // No concurrent OLC writers can start while ACW = -1 (they spin-wait).
             // Page-level latches (TryLatchPageExclusive) are still detected by the seqlock.
             using var staging = stagingPool.Rent();
-            if (!CopyPageWithSeqlock(livePageAddr, staging.Pointer))
+            if (!CopyPageWithSeqlock(livePageAddr, staging.Pointer, memPageIndex))
             {
                 // Page has an active writer (via TryLatchPageExclusive) — skip it. The page stays dirty and will be picked up in the next checkpoint cycle.
                 // This prevents deadlock when the writer is blocked on backpressure waiting for THIS checkpoint to free pages.
@@ -2092,6 +2114,59 @@ public partial class PagedMMF : ResourceNode, IMemoryResource
     }
 
     internal unsafe byte* GetMemPageAddress(int memPageIndex) => &_memPagesAddr[memPageIndex * (long)PageSize];
+
+    /// <summary>
+    /// Test/diagnostic invariant check for the seqlock protocol: a quiescent (<see cref="PageState.Idle"/>) page that participates in the seqlock must carry an
+    /// EVEN <see cref="PageBaseHeader.ModificationCounter"/> — an odd value signals a write in progress, but an Idle page has no writer. Returns the number of
+    /// such Idle slots whose counter is odd; a correct engine always returns 0. A non-zero result means a slot was reused without resetting the stale counter
+    /// (guarded in <see cref="TryAcquire"/>), which makes <see cref="CopyPageWithSeqlock"/> spin-wait the skip timeout on a page nobody is writing.
+    /// </summary>
+    internal int CountQuiescentPagesWithOddSeqlock() => CollectQuiescentOddSeqlockDiagnostics().Count;
+
+    /// <summary>
+    /// Test/diagnostic companion to <see cref="CountQuiescentPagesWithOddSeqlock"/>: returns a per-page description of every stably-Idle-with-odd-counter slot.
+    /// The full slot state (file page, counter value, dirty/ACW/refcount/epoch) is captured under <see cref="PageInfo.StateSyncRoot"/> so the snapshot is
+    /// coherent. Externally-persisted pages (the CK-05 meta pair, <see cref="IsExternallyPersisted"/>) are EXCLUDED: they use a different header format, are
+    /// written only by PersistMetaNow, and never flow through <see cref="CopyPageWithSeqlock"/> — the bytes at the ModificationCounter offset are meta/generation
+    /// data, not a seqlock counter, so applying the invariant to them is a category error (they legitimately read "odd").
+    /// </summary>
+    internal unsafe List<string> CollectQuiescentOddSeqlockDiagnostics()
+    {
+        var hits = new List<string>();
+        for (var i = 0; i < MemPagesCount; i++)
+        {
+            var pi = _memPagesInfo[i];
+            if (pi.PageState != PageState.Idle)
+            {
+                continue;
+            }
+            // The meta pair does not participate in the seqlock (see the remark above) — its ModificationCounter offset holds directory/generation data. Skip it.
+            if (IsExternallyPersisted(pi.FilePageIndex))
+            {
+                continue;
+            }
+            var hdr = (PageBaseHeader*)(_memPagesAddr + i * (long)PageSize);
+            if ((hdr->ModificationCounter & 1) == 0)
+            {
+                continue;
+            }
+            pi.StateSyncRoot.EnterExclusiveAccess(ref WaitContext.Null);
+            var counter = hdr->ModificationCounter;
+            var state = pi.PageState;
+            var filePage = pi.FilePageIndex;
+            var dirty = pi.DirtyCounter;
+            var acw = pi.ActiveChunkWriters;
+            var refCount = pi.SlotRefCount;
+            var epoch = pi.AccessEpoch;
+            var crc = pi.CrcVerified;
+            pi.StateSyncRoot.ExitExclusiveAccess();
+            if (state == PageState.Idle && (counter & 1) != 0)
+            {
+                hits.Add($"memPage={i} filePage={filePage} counter={counter} state={state} dirty={dirty} acw={acw} refCount={refCount} epoch={epoch} crcVerified={crc}");
+            }
+        }
+        return hits;
+    }
 
     /// <summary>Diagnostic snapshot of a page's protection state. Used by ChunkAccessor error reporting.</summary>
     internal (int DirtyCounter, int ActiveChunkWriters, int SlotRefCount, long AccessEpoch, PageState PageState, bool CrcVerified) GetPageInfoForDiagnostic(int memPageIndex)
