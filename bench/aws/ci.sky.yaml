@@ -55,8 +55,10 @@ setup: |
   if [ "$RUN_ENGINE" = "true" ]; then
     dotnet build test/Typhon.Engine.Tests/Typhon.Engine.Tests.csproj -c Release
   fi
+  # SkipClientBuild=true: do NOT build the SPA here. The run: phase builds wwwroot once (orval → vite build)
+  # before the --no-build test run, so building it here too just ran a full orval+tsc+vite that was thrown away.
   if [ "$RUN_WORKBENCH" = "true" ]; then
-    dotnet build test/Typhon.Workbench.Tests/Typhon.Workbench.Tests.csproj -c Release
+    dotnet build test/Typhon.Workbench.Tests/Typhon.Workbench.Tests.csproj -c Release -p:SkipClientBuild=true
   fi
 
 # NOTE: do not use `set -e` here — we run several suites, capture each exit code, and want the
@@ -65,6 +67,10 @@ run: |
   set -uo pipefail
   export DOTNET_ROOT="$HOME/.dotnet"
   export PATH="$DOTNET_ROOT:$DOTNET_ROOT/tools:$PATH"
+  # Test DBs (Path.GetTempPath()) go on the local instance-store NVMe, not the EBS root. The WAL/durability
+  # fixtures are fsync-latency-bound and run ~10x faster on NVMe (measured 2026-07-21: WAL cluster 3s vs 32s on
+  # the gp3 root; fsync 68us vs 2.77ms). /nvme is already mounted (setup) and bundled in the c6id price — free. #466
+  export TMPDIR=/nvme
   # NOTE on parallelism: a single 16-worker `dotnet test` process is BOTH slow (the suite's 116
   # [NonParallelizable] fixtures pin it ~91% serial) AND flaky (parallel fixtures collide on the
   # engine's process-static state). The engine block below instead shards into K serial (workers=1)
@@ -94,6 +100,10 @@ run: |
   # --- Workbench: TS toolchain + .NET tests (BLOCKING); Playwright e2e is deferred (P5) ---
   if [ "$RUN_WORKBENCH" = "true" ]; then
     echo "## Workbench" >> "$S"
+    # Single SPA build for the whole gate: generate-types runs orval ONCE; the final `vite build` produces
+    # wwwroot WITHOUT re-running orval/tsc (was `npm run build`, whose `prebuild` reran orval + a second tsc).
+    # vite-plugin-checker still typechecks/lints at build time, so the earlier explicit tsc/lint stay as clear
+    # separate gates. Net: orval 1× + vite 1× (was orval 3× / vite 2× across setup + run).
     (
       cd "$REPO/tools/Typhon.Workbench/ClientApp"
       npm ci --no-audit --no-fund && \
@@ -101,7 +111,7 @@ run: |
       npx tsc --noEmit && \
       npm run lint && \
       npx vitest run && \
-      npm run build
+      npx vite build
     ) 2>&1 | tee "$OUT/workbench-client.log"
     if [ "${PIPESTATUS[0]}" -eq 0 ]; then echo "- ✅ client toolchain (typecheck/lint/vitest/build) passed" >> "$S"
     else RC=1; echo "- ❌ client toolchain FAILED" >> "$S"
